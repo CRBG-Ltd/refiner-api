@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "refiner-api"
+version = "0.1.0"
+description = "Helper library for managing API calls to AFD's Refiner application. (Requires a licence from AFD Software to use.)"
+authors = [
+  { name="Jon Hart", email="hartjc@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)"
+]
+dependencies = ["lxml", "pandas", "requests"]
+
+[tool.setuptools.packages.find]
+include = ["refiner_api*"]
+
+[project.urls]
+"Source Code" = "https://github.com/CRBG-Ltd/refiner-api"
+"Bug Tracker" = "https://github.com/CRBG-Ltd/refiner-api/issues"
