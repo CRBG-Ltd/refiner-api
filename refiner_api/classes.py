@@ -151,7 +151,7 @@ class ApiCall:
     data = ''
     first_row = []
 
-    def __init__(self, api_servers, api_server_id, refiner_fields, batch_data=None):
+    def __init__(self, settings, server_id=0, batch_data=None):
         """
 Set up an API call to a Refiner API server
         :param api_servers: list - all available Refiner API servers
@@ -159,11 +159,18 @@ Set up an API call to a Refiner API server
         :param refiner_fields: list
         :param batch_data:
         """
-        self.api_servers = api_servers
-        self.api_server_id = api_server_id
-        self.out_fields = refiner_fields
+        self.stop_event = None
+        self.log_folder = settings.get('log_folder', '')
+        self.api_servers = settings.get('servers', None)
+        self.api_server_id = server_id
+        self.out_fields = settings.get('return_fields', None)
         if batch_data:
             if isinstance(batch_data, list):
+                # batch_data is a list containing:
+                #   the API data string
+                #   the row indexes for the source df
+                #   the batch ID
+                #   stop_on_error flag
                 api_str = batch_data[0]
                 self.data = api_str.encode('utf-8')
                 self.first_row = api_str.split('\n')[0]
@@ -181,45 +188,84 @@ Set up an API call to a Refiner API server
 
     def call_api(self, api_str=None, index=None):
         """
-Send batch call to Refiner API
+        Send a batch call to the Refiner API
         :return: pd.DataFrame
         """
         api_server = self.get_server()
+
         if api_str:
             self.data = api_str.encode('utf-8')
             self.first_row = api_str.split('\n')[0]
+
         if index:
             self.index = index
-        batch = pd.DataFrame()
-        try:
-            response = requests.post(api_server.uri_stem, data=self.data)
-            r_out = response.text
-            # print('refiner_api.API.call_api.response.text', r_out)
-            try:
-                batch = pd.read_json(StringIO(r_out)).fillna('').astype(str)  # .iloc[1:]
-            except XMLSyntaxError:
-                api_server.log.create_entry([api_server.name, self.data, r_out])
-            if batch.shape[1] > 2:
-                batch['UDPRN'] = batch['UDPRN'].apply(lambda r: ('00000000' + r.split('.')[0])[-8:])
-                batch['UPRN'] = batch['UPRN'].apply(lambda r: ('000000000000' + r.split('.')[0])[-12:])
-                batch['Closeness'] = batch['Closeness'].apply(lambda r: r.split('.')[0])
-            else:
-                for f in self.out_fields:
-                    batch[f] = ''
-                batch['UDPRN'] = '00000000'
-                batch['UPRN'] = '000000000000'
-                batch['Closeness'] = '0'
-            retry_count = 10
-        except KeyError:
-            raise ApiSetupError(['api_key', batch, self.data])
-        # except requests.exceptions.ConnectionError:
-        #     api_server.log.create_entry(['Call Failed - ConnectionError', api_server.name, self.first_row])
 
-        if not isinstance(self.index, NoneType):
-            # print('**   refiner_api.API.call_api.index', self.index, batch.index)
-            batch.index = self.index
-        # api_server.log.create_entry([api_server.name, self.first_row, batch.iloc[0]])
+        # How many rows are being submitted?
+        expected_row_count = len(self.index) if not isinstance(self.index, NoneType) else None
+        retry_count = 0
+        max_retries = 10
+        r_out = 'No response from API'
+
+        # Create an empty DataFrame to prevent errors in this call crashing the whole process
+        batch = pd.DataFrame()
+        for f in self.out_fields:
+            batch[f] = ''
+        batch['UDPRN'] = '00000000'
+        batch['UPRN'] = '000000000000'
+        batch['Closeness'] = '0'
+        batch['Organisation'] = 'No Data Returned'
+
+        while retry_count < max_retries:
+            try:
+                response = requests.post(api_server.uri_stem, data=self.data)
+                r_out = response.text
+
+                try:
+                    batch = pd.read_json(StringIO(r_out)).fillna('').astype(str)
+                except XMLSyntaxError:
+                    api_server.log.create_entry([api_server.name, self.data, r_out])
+                    retry_count += 1
+                    continue
+
+                if expected_row_count is not None and len(batch) != expected_row_count:
+                    api_server.log.create_entry(['api_fail', f"{len(batch)} v {expected_row_count}", batch])
+                    retry_count += 1
+                    continue
+
+                # If we have a successful return from the API, we can clean up the data
+                if batch.shape[1] > 2 and not batch.empty and batch.at[0, 'Organisation'] != 'No Data Returned':
+                    batch['UDPRN'] = batch['UDPRN'].apply(lambda r: ('00000000' + r.split('.')[0])[-8:])
+                    batch['UPRN'] = batch['UPRN'].apply(lambda r: ('000000000000' + r.split('.')[0])[-12:])
+                    batch['Closeness'] = batch['Closeness'].apply(lambda r: r.split('.')[0])
+
+                if expected_row_count is not None:
+                    batch.index = self.index
+
+                return batch
+
+            except KeyError:
+                raise ApiSetupError(['api_key', batch, self.data])
+
+        # Retries exhausted
+        data_file = os.path.join(self.log_folder, f"batch_{self.index[0]}_submission_data.csv")
+        batch_file = os.path.join(self.log_folder, f"batch_{self.index[0]}_response_data.csv")
+        api_server.log.create_entry(['API failed after retries', data_file, batch_file])
+
+        with open(data_file, 'w') as f:
+            f.write(self.data.decode('utf-8'))
+
+        if batch.empty:
+            with open(batch_file, 'w') as f:
+                f.write(r_out)
+        else:
+            batch.to_csv(batch_file, index=False)
+
+        if getattr(self, 'stop_on_error', False):
+            raise RuntimeError("API failed after retries")
+
+        # return empty batch so processing can continue
         return batch
+
 
 
 class Config:
