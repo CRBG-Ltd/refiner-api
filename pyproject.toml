@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "refiner-api"
-version = "0.1.0"
+version = "1.1.0"
 description = "Helper library for managing API calls to AFD's Refiner application. (Requires a licence from AFD Software to use.)"
 authors = [
   { name="Jon Hart", email="hartjc@gmail.com" }
