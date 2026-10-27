@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import pandas as pd
 import requests
 import time
@@ -20,6 +21,9 @@ def get_apis(log, api_server_info, refiner_request_fields=None):
 
 
 def check_batch(api):
+    if api.stop_event.is_set():
+        return None
+
     retry_count = 0
     calls_failed = 0
     api_server =  api.api_servers[api.api_server_id]
@@ -43,27 +47,13 @@ def check_batch(api):
     return result
 
 
-"""
-CHANGELOG
-
-1.0.1   Added ApiServer.online to show if service is running properly
-1.0     First release 22/02/2023
-
-
-Sample test data:
-
-"""
-
 def check_addresses(ini, blob):
     """
-    NB: The Config class is a custom object for setting global variables in a way that is more controllable and therefore more
-    predictable. Usually instantiated as the *ini* object, Config contains both mutable and immutable objects. Immutable
-    objects prevent devs inadvertently overwriting the value of list or dictionary item, thus averting the classic problem
-    with global variables. Although they do offer a limited layer of security, they should not be considered secure.
+    Takes a loaded Blob object and checks the addresses in it against the Refiner API.
 
     :param ini: Config object with global variables (api_log, api_servers, api_batch_size, api_retries,
                 job_specs['Internal']['LogUrl'], refiner_output_fields, multi_threaded_mode)
-    :param blob: Blob object containing address data and metadata, including the address fields to be used in the API call.
+    :param blob: data_asset_manager.Blob object containing address data and metadata, including the address fields to be used in the API call.
     :return: Blob object with API results appended to the data_frame attribute
     """
     def prep_row(row, in_address_fields):
@@ -161,15 +151,9 @@ def check_addresses(ini, blob):
 
     return blob
 
-def check_data_frame(ini, df, address_fields):
+def check_data_frame(refiner_settings, df, address_fields):
     """
-    NB: The Config class is a custom object for setting global variables in a way that is more controllable and therefore more
-    predictable. Usually instantiated as the *ini* object, Config contains both mutable and immutable objects. Immutable
-    objects prevent devs inadvertently overwriting the value of list or dictionary item, thus averting the classic problem
-    with global variables. Although they do offer a limited layer of security, they should not be considered secure.
-
-    :param ini: Config object with global variables (api_log, api_servers, api_batch_size, api_retries,
-                job_specs['Internal']['LogUrl'], refiner_output_fields, multi_threaded_mode)
+    :param refiner_settings: dict containing:- root, apis, servers, threaded_mode, return_fields, refiner_postcode_field, api_batch_size, api_chunk_size, api_retries, log_folder, api_log, stop_on_error
     :param df: DataFrame, including the address fields to be used in the API call.
     :param address_fields: list of address field names to be included in API call
     :return: DataFrame with API results appended
@@ -202,37 +186,63 @@ def check_data_frame(ini, df, address_fields):
             :param thread_objects: **kwargs
             :return: pd.DataFrame with API results
             """
-            api_servers = thread_objects.get('apis')
             batch_list = thread_objects.get('address_list')
-            refiner_fields = thread_objects.get('refiner_fields')
-            batch_index = thread_objects.get('row_ids')
             thread_count = len(batch_list)
-            if len(api_servers) > 1 or thread_objects.get('multi_thread_mode'):
+            stop_event = threading.Event()
+            error_count = 0
+            apsc = len(refiner_settings['servers'])
+            if apsc > 1 or thread_objects.get('multi_thread_mode'):
                 proc_list = []
                 while len(batch_list) > 0:
                     s_id = 0  # Selected API Server ID
-                    while s_id < len(api_servers) and len(batch_list) > 0:
-                        api_call = ApiCall(api_servers, s_id, refiner_fields, batch_list.pop(0))
+                    while s_id < apsc and len(batch_list) > 0:
+                        api_call = ApiCall(settings=refiner_settings,
+                                           server_id=s_id,
+                                           batch_data=batch_list.pop(0))
+                        api_call.stop_event = stop_event
                         proc_list.append(api_call)
                         s_id += 1
 
                 MAX_THREADS = 30
+                process_results = []
                 with ThreadPoolExecutor(max_workers=min(thread_count, MAX_THREADS)) as executor:
-                    process_results = list(executor.map(check_batch, proc_list))
+                    for result in executor.map(check_batch, proc_list):
+                        if isinstance(result, Exception):
+                            error_count += 1
+                            if error_count >= error_limit:
+                                stop_event.set()
+                                break
+                        elif result is not None:
+                            process_results.append(result)
             else:
-                ini.api_log.create_entry(['Multi-thread disabled'])
+                log.create_entry(['Multi-thread disabled'])
                 process_results = []
                 for batch in batch_list:
-                    api_call = ApiCall(api_servers, 0, refiner_fields, batch)
-                    batch_df = check_batch(api_call)
-                    process_results.append(batch_df)
+
+                    if stop_event.is_set():
+                        break
+
+                    api_call = ApiCall(settings=refiner_settings,
+                                       server_id=0,
+                                       batch_data=batch)
+                    api_call.stop_event = stop_event
+
+                    result = check_batch(api_call)
+
+                    if isinstance(result, Exception):
+                        error_count += 1
+                        if error_count >= error_limit:
+                            stop_event.set()
+                            break
+                    elif result is not None:
+                        process_results.append(result)
 
             chunk_df = pd.concat(process_results, ignore_index=False)
 
             return chunk_df
 
-        ts = StopWatch()
-        ini.api_log.start_text_logging(ini.job_specs['Internal']['LogUrl'], reset_log=True)
+        time_tracker = StopWatch()
+        log.start_text_logging(refiner_settings['log_folder'] + 'api_log.log', reset_log=True)
 
         first_row = 0
         last_row = in_df.shape[0]
@@ -241,21 +251,25 @@ def check_data_frame(ini, df, address_fields):
         df_slice = pd.DataFrame()
 
         while first_row < last_row:
-            batch_end = first_row + ini.api_batch_size
+            batch_end = first_row + refiner_settings['api_batch_size']
             df_slice = in_df.iloc[first_row:batch_end]
-            api_data.append(['\n'.join(df_slice['api']), df_slice.index])
-            first_row += ini.api_batch_size
+            # Concatenate all the concatenated addresses from the batches, using a linefeed as a delimiter.
+            api_data.append(['\n'.join(df_slice['api']), df_slice.index, first_row, error_limit])
+            first_row += refiner_settings['api_batch_size']
             batch_count += 1
 
-        df_out = process_data(multi_thread_mode=ini.multi_threaded_mode,  # optional
-                               apis=ini.api_servers,
-                               address_list=api_data,
-                               refiner_fields=ini.refiner_output_fields,
-                               retry_limit=ini.api_retries)
-        ini.api_log.create_entry(['Chunk complete: Batch Count ', batch_count, ' Time taken ', ts.check_lap()])
-        return df_out
+        df_returned = process_data(
+            settings=refiner_settings,
+            address_list=api_data
+        )
+        return df_returned
 
+    error_limit = refiner_settings.get('stop_on_error', 1)
+    log = refiner_settings['api_log']
     df['api'] = df.apply(lambda r: prep_row(r, address_fields), axis=1)
-    df = check_df(df)
+    df_out = check_df(df)
+    if not isinstance(df_out, pd.DataFrame):
+        log.create_entry(['API call failed', df_out])
+        df_out = pd.DataFrame(columns=refiner_settings['return_fields'])
 
-    return df
+    return df_out
