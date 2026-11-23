@@ -1,6 +1,7 @@
 from io import StringIO
 from types import NoneType
 from lxml.etree import XMLSyntaxError
+import os
 import pandas as pd
 import requests
 from log_manager import LogManager
